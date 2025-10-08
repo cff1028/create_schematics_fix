@@ -21,7 +21,7 @@ public class Config {
     public final ModConfigSpec.LongValue maxStableTime;
     public final ModConfigSpec.BooleanValue autoCleanAnomalies;
     public final ModConfigSpec.BooleanValue backupAnomalousFiles;
-    public final ModConfigSpec.ConfigValue<List<? extends String>> bannedKeywords;
+    public final ModConfigSpec.BooleanValue notifyPlayerOnAnomaly;
     
     public Config(ModConfigSpec.Builder builder) {
         builder.comment("Schematic Fix Mod Configuration")
@@ -46,12 +46,10 @@ public class Config {
         backupAnomalousFiles = builder
             .comment("Backup anomalous files to anomaly directory")
             .define("backupAnomalousFiles", true);
-            
-        bannedKeywords = builder
-            .comment("List of banned keywords that will cause immediate file deletion when found in NBT")
-            .defineList("bannedKeywords", 
-                Arrays.asList("clickEvent", "run_command", "create:filter", "create:attribute_filter"),
-                obj -> obj instanceof String);
+
+        notifyPlayerOnAnomaly = builder
+            .comment("Notify player in chat when anomalies are detected")
+            .define("notifyPlayerOnAnomaly", false);
             
         builder.pop();
     }
