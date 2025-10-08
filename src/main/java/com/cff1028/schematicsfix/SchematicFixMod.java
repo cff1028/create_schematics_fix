@@ -77,7 +77,7 @@ public class SchematicFixMod {
         return fileWatcherRunning;
     }
     
-    public List<String> getBannedKeywords() {
-        return nbtDetector != null ? nbtDetector.getBannedKeywords() : List.of();
+    public List<String> getRuleNames() {
+        return nbtDetector != null ? nbtDetector.getRuleNames() : List.of();
     }
 }
