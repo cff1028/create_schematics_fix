@@ -1,0 +1,50 @@
+version: "1.0"
+rules:
+  - name: "valve_handle_scroll_cleanup"
+    target_path: "blocks[*].nbt"
+    conditions:
+      - type: "field_equals"
+        path: "id"
+        value: "create:valve_handle"
+    cleanup_actions:
+      - type: "conditional_remove"
+        target_path: "ScrollValue"
+        condition:
+          type: "field_not_equals"
+          path: "ScrollValue"
+          value: 45
+        remove_strategy: "field_only"
+
+  - name: "clipboard_container_cleanup"
+    target_path: "blocks[*].nbt"
+    conditions:
+      - type: "field_equals"
+        path: "id"
+        value: "create:clipboard"
+    cleanup_actions:
+      - type: "path_remove"
+        target_path: "Item.components.minecraft:container"
+        remove_strategy: "entire_object"
+
+      - type: "path_remove"
+        target_path: "Item.components.minecraft:enchantments"
+        remove_strategy: "entire_object"
+
+      - type: "path_remove"
+        target_path: "Item.components.minecraft:attribute_modifiers"
+        remove_strategy: "entire_object"
+
+  - name: "sign_clickevent_cleanup"
+    target_path: "blocks[*].nbt"
+    conditions:
+      - type: "field_equals"
+        path: "id"
+        value: "minecraft:sign"
+    cleanup_actions:
+      - type: "nested_string_remove"
+        target_path: "front_text.messages[*]"
+        condition:
+          type: "string_contains"
+          value: "clickEvent"
+        remove_pattern: "\"clickEvent\":\\s*\\{[^}]*\\}"
+        remove_strategy: "regex_replace"
