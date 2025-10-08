@@ -1,1 +1,0 @@
-{"id":"create:clipboard","whitelist":["components"],"include":{"components":{"whitelist":["create:clipboard_pages","create:clipboard_read_only","create:clipboard_type","minecraft:custom_name"]}}}
