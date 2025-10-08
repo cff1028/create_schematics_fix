@@ -1,5 +1,6 @@
 package com.cff1028.schematicsfix;
 
+import java.util.stream.Collectors;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
@@ -8,6 +9,8 @@ import com.google.gson.JsonArray;
 import net.minecraft.nbt.*;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.yaml.snakeyaml.Yaml;
+import org.yaml.snakeyaml.DumperOptions;
 
 import java.io.*;
 import java.nio.file.Files;
@@ -15,23 +18,35 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.*;
+import java.util.regex.Pattern;
 import java.util.zip.GZIPInputStream;
-import java.util.zip.InflaterInputStream;
+import java.util.zip.GZIPOutputStream;
+
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerPlayer;
+import net.neoforged.neoforge.server.ServerLifecycleHooks;
+import net.minecraft.network.chat.Component;
+import net.minecraft.ChatFormatting;
 
 public class SchematicNBTDetector {
     private static final Logger LOGGER = LogManager.getLogger();
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
-    private static final Set<String> DEFAULT_IGNORED_KEYS = Set.of("count", "id");
+    private static final Yaml YAML = createYaml();
     
     private final Path configPath;
     private final List<FilterRule> filterRules;
-    private final List<String> bannedKeywords;
     
     public SchematicNBTDetector() {
-        this.configPath = Paths.get("config/schematicsfix.jsonl").toAbsolutePath();
+        this.configPath = Paths.get("config/schematicsfix.yaml").toAbsolutePath();
         this.filterRules = new ArrayList<>();
-        this.bannedKeywords = new ArrayList<>();
         loadConfig();
+    }
+    
+    private static Yaml createYaml() {
+        DumperOptions options = new DumperOptions();
+        options.setDefaultFlowStyle(DumperOptions.FlowStyle.BLOCK);
+        options.setPrettyFlow(true);
+        return new Yaml(options);
     }
     
     private void loadConfig() {
@@ -39,21 +54,14 @@ public class SchematicNBTDetector {
             try {
                 Files.createDirectories(configPath.getParent());
                 copyDefaultConfig();
-                LOGGER.info("Created default config file from assets: {}", configPath);
+                LOGGER.info("\033[94mCreated default config file from assets: {}\033[0m", configPath);
             } catch (IOException e) {
-                LOGGER.error("Failed to create config file: {}", configPath, e);
+                LOGGER.error("\033[91mFailed to create config file: {}\033[0m", configPath, e);
             }
             return;
         }
         
         reloadConfigInternal();
-    }
-    
-    /**
-     * 获取当前加载的禁止关键词列表
-     */
-    public List<String> getBannedKeywords() {
-        return new ArrayList<>(bannedKeywords);
     }
 
     /**
@@ -61,55 +69,50 @@ public class SchematicNBTDetector {
      * @return 是否成功加载
      */
     public boolean reloadConfig() {
-        LOGGER.info("Reloading schematic filter configuration...");
-        boolean success = reloadConfigInternal();
-        loadBannedKeywords();
-        return success;
+        LOGGER.info("\033[94mReloading schematic filter configuration...\033[0m");
+        return reloadConfigInternal();
     }
     
-    private void loadBannedKeywords() {
-        bannedKeywords.clear();
-        try {
-            List<? extends String> keywords = Config.INSTANCE.bannedKeywords.get();
-            bannedKeywords.addAll(keywords);
-            LOGGER.info("Loaded {} banned keywords: {}", bannedKeywords.size(), bannedKeywords);
-        } catch (Exception e) {
-            LOGGER.error("Failed to load banned keywords from config", e);
-            // 使用默认值
-            bannedKeywords.addAll(Arrays.asList("clickEvent", "run_command", "create:filter", "create:attribute_filter"));
-        }
+    /**
+     * 获取当前加载的规则名称列表
+     */
+    public List<String> getRuleNames() {
+        return filterRules.stream()
+                .map(rule -> rule.name)
+                .collect(java.util.stream.Collectors.toList());
     }
-    
+
     private boolean reloadConfigInternal() {
         filterRules.clear();
-        loadBannedKeywords();
         
-        int lineNumber = 0;
-        int loadedRules = 0;
-        
-        try (BufferedReader reader = Files.newBufferedReader(configPath)) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                lineNumber++;
-                line = line.trim();
-                if (line.isEmpty()) continue;
-                
+        try (InputStream input = Files.newInputStream(configPath)) {
+            Map<String, Object> config = YAML.load(input);
+            
+            if (config == null || !config.containsKey("rules")) {
+                LOGGER.warn("\033[91mNo rules found in config file\033[0m");
+                return false;
+            }
+            
+            List<Map<String, Object>> rules = (List<Map<String, Object>>) config.get("rules");
+            int loadedRules = 0;
+            
+            for (Map<String, Object> ruleData : rules) {
                 try {
-                    JsonObject ruleJson = JsonParser.parseString(line).getAsJsonObject();
-                    FilterRule rule = parseFilterRule(ruleJson);
+                    FilterRule rule = parseFilterRule(ruleData);
                     if (rule != null) {
                         filterRules.add(rule);
                         loadedRules++;
-                        LOGGER.debug("Loaded filter rule for id: {}", rule.id);
+                        LOGGER.debug("Loaded filter rule: {}", rule.name);
                     }
                 } catch (Exception e) {
-                    LOGGER.warn("Failed to parse rule at line {}: {}", lineNumber, line, e);
+                    LOGGER.warn("\033[91mFailed to parse rule: {}\033[0m", ruleData, e);
                 }
             }
-            LOGGER.info("Loaded {} filter rules from config", loadedRules);
+            
+            LOGGER.info("\033[94mLoaded {} filter rules from config\033[0m", loadedRules);
             return true;
         } catch (IOException e) {
-            LOGGER.error("Failed to load config file: {}", configPath, e);
+            LOGGER.error("\033[91mFailed to load config file: {}\033[0m", configPath, e);
             return false;
         }
     }
@@ -117,135 +120,162 @@ public class SchematicNBTDetector {
     private void copyDefaultConfig() {
         InputStream inputStream = null;
         try {
-            inputStream = getClass().getResourceAsStream("/assets/schematicsfix/schematicsfix.jsonl");
+            inputStream = getClass().getResourceAsStream("/assets/schematicsfix/schematicsfix.yaml");
             
             if (inputStream == null) {
-                inputStream = getClass().getClassLoader().getResourceAsStream("assets/schematicsfix/schematicsfix.jsonl");
+                inputStream = getClass().getClassLoader().getResourceAsStream("assets/schematicsfix/schematicsfix.yaml");
             }
             
             if (inputStream != null) {
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream));
-                     BufferedWriter writer = Files.newBufferedWriter(configPath)) {
-                    
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        writer.write(line);
-                        writer.newLine();
-                    }
-                    LOGGER.info("Successfully copied default config from assets");
-                }
+                Files.copy(inputStream, configPath, StandardCopyOption.REPLACE_EXISTING);
+                LOGGER.info("\033[94mSuccessfully copied default config from assets\033[0m");
             } else {
-                LOGGER.warn("Default config not found in assets, creating example config file");
+                LOGGER.warn("\033[91mDefault config not found in assets, creating example config file\033[0m");
                 createExampleConfig();
             }
         } catch (Exception e) {
-            LOGGER.error("Failed to copy default config from assets", e);
+            LOGGER.error("\033[91mFailed to copy default config from assets\033[0m", e);
             try {
                 createExampleConfig();
             } catch (IOException ex) {
-                LOGGER.error("Failed to create example config file", ex);
+                LOGGER.error("\033[91mFailed to create example config file\033[0m", ex);
             }
         } finally {
             if (inputStream != null) {
                 try {
                     inputStream.close();
                 } catch (IOException e) {
-                    LOGGER.error("Error closing input stream", e);
+                    LOGGER.error("\033[91mError closing input stream\033[0m", e);
                 }
             }
         }
     }
     
     private void createExampleConfig() throws IOException {
-        try (BufferedWriter writer = Files.newBufferedWriter(configPath)) {
-            // 创建示例配置
-            JsonObject chestRule = new JsonObject();
-            chestRule.addProperty("id", "minecraft:chest");
-            
-            JsonArray blacklist = new JsonArray();
-            blacklist.add("Items");
-            blacklist.add("Lock");
-            blacklist.add("LootTable");
-            chestRule.add("blacklist", blacklist);
-            
-            writer.write(GSON.toJson(chestRule));
-            writer.newLine();
-            
-            JsonObject shulkerRule = new JsonObject();
-            shulkerRule.addProperty("id", "minecraft:shulker_box");
-            shulkerRule.add("blacklist", blacklist);
-            
-            writer.write(GSON.toJson(shulkerRule));
-            writer.newLine();
-            
-            LOGGER.info("Created example configuration");
+        Map<String, Object> config = new LinkedHashMap<>();
+        config.put("version", "1.0");
+        
+        List<Map<String, Object>> rules = new ArrayList<>();
+        
+        // 示例规则1: valve_handle 清理
+        Map<String, Object> valveRule = new LinkedHashMap<>();
+        valveRule.put("name", "valve_handle_capacity_cleanup");
+        valveRule.put("target_path", "blocks[*].nbt");
+        
+        List<Map<String, Object>> valveConditions = new ArrayList<>();
+        Map<String, Object> valveCondition = new LinkedHashMap<>();
+        valveCondition.put("type", "field_equals");
+        valveCondition.put("path", "id");
+        valveCondition.put("value", "create:valve_handle");
+        valveConditions.add(valveCondition);
+        valveRule.put("conditions", valveConditions);
+        
+        List<Map<String, Object>> valveActions = new ArrayList<>();
+        
+        Map<String, Object> capacityAction = new LinkedHashMap<>();
+        capacityAction.put("type", "conditional_remove");
+        capacityAction.put("target_path", "Network.Capacity");
+        Map<String, Object> capacityCondition = new LinkedHashMap<>();
+        capacityCondition.put("type", "field_not_equals");
+        capacityCondition.put("path", "Network.Capacity");
+        capacityCondition.put("value", 256.0);
+        capacityAction.put("condition", capacityCondition);
+        capacityAction.put("remove_strategy", "field_only");
+        valveActions.add(capacityAction);
+        
+        Map<String, Object> speedAction = new LinkedHashMap<>();
+        speedAction.put("type", "conditional_remove");
+        speedAction.put("target_path", "Speed");
+        Map<String, Object> speedCondition = new LinkedHashMap<>();
+        speedCondition.put("type", "field_not_equals");
+        speedCondition.put("path", "Speed");
+        speedCondition.put("value", 32.0);
+        speedAction.put("condition", speedCondition);
+        speedAction.put("remove_strategy", "field_only");
+        valveActions.add(speedAction);
+        
+        valveRule.put("cleanup_actions", valveActions);
+        rules.add(valveRule);
+        
+        config.put("rules", rules);
+        
+        try (FileWriter writer = new FileWriter(configPath.toFile())) {
+            YAML.dump(config, writer);
         }
+        
+        LOGGER.info("Created example configuration");
     }
     
-    private FilterRule parseFilterRule(JsonObject json) {
-        if (!json.has("id")) {
+    private FilterRule parseFilterRule(Map<String, Object> ruleData) {
+        if (!ruleData.containsKey("name") || !ruleData.containsKey("target_path")) {
+            LOGGER.warn("\033[91mRule missing required fields: name and target_path\033[0m");
             return null;
         }
         
-        String id = json.get("id").getAsString();
-        FilterRule rule = new FilterRule(id);
+        String name = (String) ruleData.get("name");
+        String targetPath = (String) ruleData.get("target_path");
+        FilterRule rule = new FilterRule(name, targetPath);
         
-        if (json.has("whitelist") && json.has("blacklist")) {
-            LOGGER.warn("Rule for id '{}' has both whitelist and blacklist, ignoring this rule", id);
-            return null;
+        // 解析条件
+        if (ruleData.containsKey("conditions")) {
+            List<Map<String, Object>> conditions = (List<Map<String, Object>>) ruleData.get("conditions");
+            for (Map<String, Object> conditionData : conditions) {
+                Condition condition = parseCondition(conditionData);
+                if (condition != null) {
+                    rule.conditions.add(condition);
+                }
+            }
         }
         
-        if (json.has("whitelist")) {
-            rule.whitelist = new HashSet<>();
-            json.get("whitelist").getAsJsonArray().forEach(element -> 
-                rule.whitelist.add(element.getAsString()));
-        }
-        
-        if (json.has("blacklist")) {
-            rule.blacklist = new HashSet<>();
-            json.get("blacklist").getAsJsonArray().forEach(element -> 
-                rule.blacklist.add(element.getAsString()));
-        }
-        
-        if (json.has("include")) {
-            rule.include = parseIncludeRules(json.get("include").getAsJsonObject());
+        // 解析清理操作
+        if (ruleData.containsKey("cleanup_actions")) {
+            List<Map<String, Object>> actions = (List<Map<String, Object>>) ruleData.get("cleanup_actions");
+            for (Map<String, Object> actionData : actions) {
+                CleanupAction action = parseCleanupAction(actionData);
+                if (action != null) {
+                    rule.cleanupActions.add(action);
+                }
+            }
         }
         
         return rule;
     }
     
-    private Map<String, FilterRule> parseIncludeRules(JsonObject includeJson) {
-        Map<String, FilterRule> includeRules = new HashMap<>();
-        
-        for (String key : includeJson.keySet()) {
-            JsonObject ruleJson = includeJson.get(key).getAsJsonObject();
-            FilterRule includeRule = new FilterRule(null);
-            
-            if (ruleJson.has("whitelist") && ruleJson.has("blacklist")) {
-                LOGGER.warn("Include rule has both whitelist and blacklist, ignoring this include rule");
-                continue;
-            }
-            
-            if (ruleJson.has("whitelist")) {
-                includeRule.whitelist = new HashSet<>();
-                ruleJson.get("whitelist").getAsJsonArray().forEach(element -> 
-                    includeRule.whitelist.add(element.getAsString()));
-            }
-            
-            if (ruleJson.has("blacklist")) {
-                includeRule.blacklist = new HashSet<>();
-                ruleJson.get("blacklist").getAsJsonArray().forEach(element -> 
-                    includeRule.blacklist.add(element.getAsString()));
-            }
-            
-            if (ruleJson.has("include")) {
-                includeRule.include = parseIncludeRules(ruleJson.get("include").getAsJsonObject());
-            }
-            
-            includeRules.put(key, includeRule);
+    private Condition parseCondition(Map<String, Object> conditionData) {
+        if (!conditionData.containsKey("type")) {
+            return null;
         }
         
-        return includeRules;
+        String type = (String) conditionData.get("type");
+        Condition condition = new Condition(type);
+        
+        condition.path = (String) conditionData.get("path");
+        condition.value = conditionData.get("value");
+        
+        return condition;
+    }
+    
+    private CleanupAction parseCleanupAction(Map<String, Object> actionData) {
+        if (!actionData.containsKey("type") || !actionData.containsKey("target_path")) {
+            return null;
+        }
+        
+        String type = (String) actionData.get("type");
+        String targetPath = (String) actionData.get("target_path");
+        CleanupAction action = new CleanupAction(type, targetPath);
+        
+        action.removeStrategy = (String) actionData.get("remove_strategy");
+        
+        if (actionData.containsKey("condition")) {
+            Map<String, Object> conditionData = (Map<String, Object>) actionData.get("condition");
+            action.condition = parseCondition(conditionData);
+        }
+        
+        if (actionData.containsKey("remove_pattern")) {
+            action.removePattern = Pattern.compile((String) actionData.get("remove_pattern"));
+        }
+        
+        return action;
     }
     
     /**
@@ -255,17 +285,9 @@ public class SchematicNBTDetector {
         return filterRules.size();
     }
     
-    /**
-     * 获取当前加载的禁止关键词数量
-     */
-    public int getBannedKeywordCount() {
-        return bannedKeywords.size();
-    }
-    
     public DetectionResult detectAnomalies(String playerName, String fileName) {
         Path schematicPath = Paths.get("schematics/uploaded", playerName, fileName + ".nbt").toAbsolutePath();
         Path anomalyPath = Paths.get("schematics/anomaly", playerName, fileName + ".nbt").toAbsolutePath();
-        Path bannedPath = Paths.get("schematics/banned", playerName, fileName + ".nbt").toAbsolutePath();
         
         if (!Files.exists(schematicPath)) {
             return new DetectionResult(false, "Schematic file not found: " + schematicPath);
@@ -277,325 +299,572 @@ public class SchematicNBTDetector {
                 return new DetectionResult(false, "Failed to read NBT file - unsupported compression or corrupted file");
             }
             
-            // 首先检查禁止关键词
-            BannedKeywordResult bannedResult = checkForBannedKeywords(nbt, playerName, fileName);
-            if (bannedResult.found) {
-                // 创建禁止目录并移动文件
-                Files.createDirectories(bannedPath.getParent());
-                Files.move(schematicPath, bannedPath, StandardCopyOption.REPLACE_EXISTING);
-                
-                LOGGER.warn("BANNED KEYWORD DETECTED: File {}.nbt from player {} contained banned keyword '{}'. File moved to banned directory.", 
-                    fileName, playerName, bannedResult.keyword);
-                return new DetectionResult(true, 
-                    String.format("Banned keyword '%s' detected. Schematic has been moved to banned directory.", bannedResult.keyword));
-            }
+            boolean modified = processWithRules(nbt, playerName, fileName);
             
-            // 如果没有禁止关键词，继续常规处理
-            boolean modified = processBlocks(nbt, playerName, fileName);
-            
-            if (modified && Config.INSTANCE.backupAnomalousFiles.get()) {
-                // Create anomaly directory if needed
-                Files.createDirectories(anomalyPath.getParent());
-                // Copy original to anomaly directory
-                Files.copy(schematicPath, anomalyPath, StandardCopyOption.REPLACE_EXISTING);
-                // Write cleaned version to original location
+            if (modified) {
+                // 写入清理后的NBT到原文件
                 writeNbtFile(nbt, schematicPath);
                 
-                LOGGER.warn("Anomalous schematic {}.nbt has been detected from player {}. Original backed up.", fileName, playerName);
-                return new DetectionResult(true, 
-                    "Anomalies detected and cleaned. Original saved to anomaly directory.");
-            } else if (modified) {
-                // Write cleaned version to original location without backup
-                writeNbtFile(nbt, schematicPath);
-                LOGGER.warn("Anomalous schematic {}.nbt has been detected from player {}.", fileName, playerName);
-                return new DetectionResult(true, "Anomalies detected and cleaned.");
+                if (Config.INSTANCE.backupAnomalousFiles.get()) {
+                    // 创建异常文件备份
+                    Files.createDirectories(anomalyPath.getParent());
+                    Files.copy(schematicPath, anomalyPath, StandardCopyOption.REPLACE_EXISTING);
+                    LOGGER.warn("\033[91mRule-based anomalies detected and cleaned in {}.nbt from player {}. Original backed up.\033[0m", fileName, playerName);
+                    if (modified && Config.INSTANCE.notifyPlayerOnAnomaly.get()) {
+                        notifyPlayer(playerName, fileName);
+                    }
+                    return new DetectionResult(true, "Rule-based anomalies detected and cleaned. Original backed up to anomaly directory.");
+                } else {
+                    LOGGER.warn("\033[91mRule-based anomalies detected and cleaned in {}.nbt from player {}.\033[0m", fileName, playerName);
+                    if (modified && Config.INSTANCE.notifyPlayerOnAnomaly.get()) {
+                        notifyPlayer(playerName, fileName);
+                    }
+                    return new DetectionResult(true, "Rule-based anomalies detected and cleaned.");
+                }
             } else {
                 return new DetectionResult(false, "No anomalies detected in schematic.");
             }
             
         } catch (IOException e) {
-            LOGGER.error("Error processing schematic file: {}", schematicPath, e);
+            LOGGER.error("\033[91mError processing schematic file: {}\033[0m", schematicPath, e);
             return new DetectionResult(false, "Error processing schematic: " + e.getMessage());
         } catch (Exception e) {
-            LOGGER.error("Unexpected error processing schematic file: {}", schematicPath, e);
+            LOGGER.error("\033[91mUnexpected error processing schematic file: {}\033[0m", schematicPath, e);
             return new DetectionResult(false, "Unexpected error: " + e.getMessage());
         }
     }
     
-    /**
-     * 检查NBT数据中是否包含禁止的关键词
-     */
-    private BannedKeywordResult checkForBannedKeywords(CompoundTag nbt, String playerName, String fileName) {
-        return checkTagForBannedKeywords(nbt, "");
-    }
-    
-    private BannedKeywordResult checkTagForBannedKeywords(Tag tag, String path) {
-        if (tag instanceof CompoundTag compound) {
-            for (String key : compound.getAllKeys()) {
-                Tag child = compound.get(key);
-                BannedKeywordResult result = checkTagForBannedKeywords(child, path + "." + key);
-                if (result.found) {
-                    return result;
-                }
-            }
-        } else if (tag instanceof ListTag list) {
-            for (int i = 0; i < list.size(); i++) {
-                Tag child = list.get(i);
-                BannedKeywordResult result = checkTagForBannedKeywords(child, path + "[" + i + "]");
-                if (result.found) {
-                    return result;
-                }
-            }
-        } else if (tag instanceof StringTag stringTag) {
-            String value = stringTag.getAsString();
-            for (String keyword : bannedKeywords) {
-                if (value.contains(keyword)) {
-                    LOGGER.debug("Found banned keyword '{}' in NBT path {} with value: {}", keyword, path, value);
-                    return new BannedKeywordResult(true, keyword, path, value);
-                }
-            }
-        } else if (tag instanceof ByteArrayTag byteArray) {
-            byte[] bytes = byteArray.getAsByteArray();
-            String byteString = Arrays.toString(bytes);
-            for (String keyword : bannedKeywords) {
-                if (byteString.contains(keyword)) {
-                    LOGGER.debug("Found banned keyword '{}' in byte array at path {}", keyword, path);
-                    return new BannedKeywordResult(true, keyword, path, "[byte array]");
-                }
-            }
-        } else if (tag instanceof IntArrayTag intArray) {
-            int[] ints = intArray.getAsIntArray();
-            String intString = Arrays.toString(ints);
-            for (String keyword : bannedKeywords) {
-                if (intString.contains(keyword)) {
-                    LOGGER.debug("Found banned keyword '{}' in int array at path {}", keyword, path);
-                    return new BannedKeywordResult(true, keyword, path, "[int array]");
-                }
-            }
-        } else if (tag instanceof LongArrayTag longArray) {
-            long[] longs = longArray.getAsLongArray();
-            String longString = Arrays.toString(longs);
-            for (String keyword : bannedKeywords) {
-                if (longString.contains(keyword)) {
-                    LOGGER.debug("Found banned keyword '{}' in long array at path {}", keyword, path);
-                    return new BannedKeywordResult(true, keyword, path, "[long array]");
-                }
-            }
-        }
-        
-        return new BannedKeywordResult(false, null, null, null);
-    }
-    
-    /**
-     * 读取NBT文件，支持多种压缩格式
-     */
-    private CompoundTag readNbtFile(Path filePath) throws IOException {
-        // 方法1: 尝试标准读取（未压缩或内部处理压缩）
-        try {
-            return NbtIo.read(filePath);
-        } catch (Exception e1) {
-            LOGGER.debug("Standard NBT read failed, trying compressed formats: {}", e1.getMessage());
-        }
-        
-        // 方法2: 尝试GZIP压缩格式
-        try (InputStream is = Files.newInputStream(filePath);
-             GZIPInputStream gzipIs = new GZIPInputStream(is);
-             DataInputStream dataIs = new DataInputStream(gzipIs)) {
-            return NbtIo.read(dataIs);
-        } catch (Exception e2) {
-            LOGGER.debug("GZIP NBT read failed: {}", e2.getMessage());
-        }
-        
-        // 方法3: 尝试zlib压缩格式
-        try (InputStream is = Files.newInputStream(filePath);
-             InflaterInputStream inflaterIs = new InflaterInputStream(is);
-             DataInputStream dataIs = new DataInputStream(inflaterIs)) {
-            return NbtIo.read(dataIs);
-        } catch (Exception e3) {
-            LOGGER.debug("Zlib NBT read failed: {}", e3.getMessage());
-        }
-        
-        // 方法4: 尝试直接读取（作为未压缩）
-        try (InputStream is = Files.newInputStream(filePath);
-             DataInputStream dataIs = new DataInputStream(is)) {
-            return NbtIo.read(dataIs);
-        } catch (Exception e4) {
-            LOGGER.debug("Direct input stream NBT read failed: {}", e4.getMessage());
-        }
-        
-        // 所有方法都失败
-        LOGGER.error("All NBT reading methods failed for file: {}", filePath);
-        return null;
-    }
-    
-    /**
-     * 写入NBT文件，使用标准压缩格式
-     */
-    private void writeNbtFile(CompoundTag nbt, Path filePath) throws IOException {
-        // 使用标准写入方法，让Minecraft处理压缩
-        NbtIo.write(nbt, filePath);
-    }
-    
-    private boolean processBlocks(CompoundTag rootNbt, String playerName, String fileName) {
-        if (!rootNbt.contains("blocks", 9)) { // 9 = ListTag
-            LOGGER.debug("No blocks found in NBT file {}.nbt", fileName);
-            return false;
-        }
-        
-        ListTag blocks = rootNbt.getList("blocks", 10); // 10 = CompoundTag
+    private boolean processWithRules(CompoundTag rootNbt, String playerName, String fileName) {
         boolean modified = false;
         
-        LOGGER.debug("Processing {} blocks in file {}.nbt", blocks.size(), fileName);
-        
-        for (int i = 0; i < blocks.size(); i++) {
-            CompoundTag block = blocks.getCompound(i);
-            if (block.contains("nbt", 10)) { // 10 = CompoundTag
-                CompoundTag nbtData = block.getCompound("nbt");
-                modified |= processNbtData(nbtData, playerName, fileName);
-            }
-        }
-        
-        return modified;
-    }
-    
-    private boolean processNbtData(CompoundTag nbtData, String playerName, String fileName) {
-        boolean modified = false;
-        
-        // Check all top-level keys that might contain item data
-        for (String key : nbtData.getAllKeys()) {
-            if (nbtData.get(key) instanceof CompoundTag itemData) {
-                modified |= processItemData(itemData, key, playerName, fileName);
-            }
-        }
-        
-        return modified;
-    }
-    
-    private boolean processItemData(CompoundTag itemData, String parentKey, String playerName, String fileName) {
-        if (!itemData.contains("id", 8)) { // 8 = StringTag
-            return false;
-        }
-        
-        String itemId = itemData.getString("id");
-        FilterRule matchingRule = findMatchingRule(itemId);
-        
-        if (matchingRule == null) {
-            return false;
-        }
-        
-        LOGGER.debug("Applying filter rule for item '{}' in file {}.nbt", itemId, fileName);
-        return applyFilterRule(itemData, matchingRule, playerName, fileName, itemId);
-    }
-    
-    private FilterRule findMatchingRule(String itemId) {
         for (FilterRule rule : filterRules) {
-            if (rule.id.equals(itemId)) {
-                return rule;
+            modified |= applyRule(rootNbt, rule, playerName, fileName);
+        }
+        
+        return modified;
+    }
+    
+    private boolean applyRule(CompoundTag root, FilterRule rule, String playerName, String fileName) {
+        boolean modified = false;
+        
+        // 解析目标路径
+        String[] pathParts = rule.targetPath.split("\\.");
+        List<CompoundTag> targets = findTargets(root, pathParts, 0);
+        
+        for (CompoundTag target : targets) {
+            // 检查条件
+            if (checkConditions(target, rule.conditions)) {
+                // 执行清理操作
+                for (CleanupAction action : rule.cleanupActions) {
+                    modified |= applyCleanupAction(target, action, playerName, fileName, rule.name);
+                }
             }
         }
+        
+        return modified;
+    }
+    
+    private List<CompoundTag> findTargets(Tag current, String[] pathParts, int depth) {
+        List<CompoundTag> results = new ArrayList<>();
+        
+        if (depth >= pathParts.length) {
+            if (current instanceof CompoundTag) {
+                results.add((CompoundTag) current);
+            }
+            return results;
+        }
+        
+        String part = pathParts[depth];
+        
+        if (part.equals("*")) {
+            // 通配符 - 遍历所有元素
+            if (current instanceof CompoundTag compound) {
+                for (String key : compound.getAllKeys()) {
+                    Tag child = compound.get(key);
+                    results.addAll(findTargets(child, pathParts, depth + 1));
+                }
+            } else if (current instanceof ListTag list) {
+                for (int i = 0; i < list.size(); i++) {
+                    Tag child = list.get(i);
+                    results.addAll(findTargets(child, pathParts, depth + 1));
+                }
+            }
+        } else if (part.endsWith("[*]")) {
+            // 数组通配符
+            String arrayName = part.substring(0, part.length() - 3);
+            if (current instanceof CompoundTag compound && compound.contains(arrayName)) {
+                Tag array = compound.get(arrayName);
+                if (array instanceof ListTag list) {
+                    for (int i = 0; i < list.size(); i++) {
+                        Tag child = list.get(i);
+                        results.addAll(findTargets(child, pathParts, depth + 1));
+                    }
+                }
+            }
+        } else {
+            // 普通路径
+            if (current instanceof CompoundTag compound && compound.contains(part)) {
+                Tag child = compound.get(part);
+                results.addAll(findTargets(child, pathParts, depth + 1));
+            }
+        }
+        
+        return results;
+    }
+    
+    private boolean checkConditions(CompoundTag target, List<Condition> conditions) {
+        for (Condition condition : conditions) {
+            if (!checkCondition(target, condition)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    private boolean checkCondition(CompoundTag target, Condition condition) {
+        try {
+            switch (condition.type) {
+                case "field_equals":
+                    return checkFieldEquals(target, condition);
+                case "field_not_equals":
+                    return !checkFieldEquals(target, condition);
+                case "field_exists":
+                    return checkFieldExists(target, condition);
+                case "string_contains":
+                    return checkStringContains(target, condition);
+                default:
+                    LOGGER.warn("\033[95mUnknown condition type: {}\033[0m", condition.type);
+                    return false;
+            }
+        } catch (Exception e) {
+            LOGGER.warn("\033[95mError checking condition: {}\033[0m", condition.type, e);
+            return false;
+        }
+    }
+    
+    private boolean checkFieldEquals(CompoundTag target, Condition condition) {
+        Tag field = getTagByPath(target, condition.path);
+        if (field == null) return false;
+        
+        Object actualValue = getTagValue(field);
+        
+        // 特殊处理浮点数比较
+        if (condition.value instanceof Double && actualValue instanceof Float) {
+            return Math.abs(((Float) actualValue) - ((Double) condition.value).floatValue()) < 0.0001;
+        }
+        
+        return Objects.equals(actualValue, condition.value);
+    }
+    
+    private boolean checkFieldExists(CompoundTag target, Condition condition) {
+        return getTagByPath(target, condition.path) != null;
+    }
+    
+    private boolean checkStringContains(CompoundTag target, Condition condition) {
+        // 使用新的路径查找方法
+        List<TagWithPath> foundTags = findTagsByPath(target, condition.path);
+        
+        for (TagWithPath tagWithPath : foundTags) {
+            Tag field = tagWithPath.tag;
+            if (field instanceof StringTag stringTag) {
+                String value = stringTag.getAsString();
+                if (value.contains((String) condition.value)) {
+                    return true;
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    private Tag getTagByPath(CompoundTag root, String path) {
+        String[] parts = path.split("\\.");
+        Tag current = root;
+        
+        for (String part : parts) {
+            if (current instanceof CompoundTag compound) {
+                if (!compound.contains(part)) {
+                    return null;
+                }
+                current = compound.get(part);
+            } else {
+                return null;
+            }
+        }
+        
+        return current;
+    }
+    
+    private Object getTagValue(Tag tag) {
+        if (tag instanceof StringTag) return ((StringTag) tag).getAsString();
+        if (tag instanceof ByteTag) return ((ByteTag) tag).getAsByte();
+        if (tag instanceof ShortTag) return ((ShortTag) tag).getAsShort();
+        if (tag instanceof IntTag) return ((IntTag) tag).getAsInt();
+        if (tag instanceof LongTag) return ((LongTag) tag).getAsLong();
+        if (tag instanceof FloatTag) return ((FloatTag) tag).getAsFloat();
+        if (tag instanceof DoubleTag) return ((DoubleTag) tag).getAsDouble();
+        if (tag instanceof ByteArrayTag) return ((ByteArrayTag) tag).getAsByteArray();
+        if (tag instanceof StringTag) return ((StringTag) tag).getAsString();
+        if (tag instanceof ListTag) return tag;
+        if (tag instanceof CompoundTag) return tag;
         return null;
     }
     
-    private boolean applyFilterRule(CompoundTag data, FilterRule rule, 
-                                  String playerName, String fileName, String itemId) {
+    private boolean applyCleanupAction(CompoundTag target, CleanupAction action, String playerName, String fileName, String ruleName) {
+        try {
+            switch (action.type) {
+                case "conditional_remove":
+                    return applyConditionalRemove(target, action, playerName, fileName, ruleName);
+                case "path_remove":
+                    return applyPathRemove(target, action, playerName, fileName, ruleName);
+                case "nested_string_remove":
+                    return applyNestedStringRemove(target, action, playerName, fileName, ruleName);
+                default:
+                    LOGGER.warn("\033[95mUnknown cleanup action type: {}\033[0m", action.type);
+                    return false;
+            }
+        } catch (Exception e) {
+            LOGGER.warn("\033[95mError applying cleanup action: {}\033[0m", action.type, e);
+            return false;
+        }
+    }
+    
+    private boolean applyConditionalRemove(CompoundTag target, CleanupAction action, String playerName, String fileName, String ruleName) {
+        if (action.condition != null && !checkCondition(target, action.condition)) {
+            return false;
+        }
+        
+        return removeTagAtPath(target, action.targetPath, playerName, fileName, ruleName);
+    }
+    
+    private boolean applyPathRemove(CompoundTag target, CleanupAction action, String playerName, String fileName, String ruleName) {
+        return removeTagAtPath(target, action.targetPath, playerName, fileName, ruleName);
+    }
+    
+    private boolean applyNestedStringRemove(CompoundTag target, CleanupAction action, String playerName, String fileName, String ruleName) {
         boolean modified = false;
         
-        // Apply main rule to current level
-        Set<String> keysToRemove = new HashSet<>();
-        for (String key : data.getAllKeys()) {
-            if (DEFAULT_IGNORED_KEYS.contains(key)) {
-                continue; // Skip count and id by default
-            }
+        try {
+            // 使用新的路径解析方法，支持数组通配符
+            List<TagWithPath> foundTags = findTagsByPath(target, action.targetPath);
             
-            if (rule.whitelist != null) {
-                if (!rule.whitelist.contains(key)) {
-                    keysToRemove.add(key);
-                }
-            } else if (rule.blacklist != null) {
-                if (rule.blacklist.contains(key)) {
-                    keysToRemove.add(key);
-                }
-            }
-        }
-        
-        // Remove invalid keys
-        for (String key : keysToRemove) {
-            data.remove(key);
-            modified = true;
-            LOGGER.info("Removed key '{}' from item '{}' in file {}.nbt", key, itemId, fileName);
-        }
-        
-        // Apply include rules recursively
-        if (rule.include != null) {
-            for (Map.Entry<String, FilterRule> includeEntry : rule.include.entrySet()) {
-                String includeKey = includeEntry.getKey();
-                FilterRule includeRule = includeEntry.getValue();
+            for (TagWithPath tagWithPath : foundTags) {
+                Tag tag = tagWithPath.tag;
+                String fullPath = tagWithPath.path;
                 
-                if (data.contains(includeKey)) {
-                    if (data.get(includeKey) instanceof CompoundTag includeData) {
-                        modified |= applyIncludeRule(includeData, includeRule, playerName, fileName, itemId, includeKey);
+                if (tag instanceof StringTag stringTag) {
+                    String original = stringTag.getAsString();
+                    
+                    // 检查条件
+                    if (action.condition != null && !original.contains((String) action.condition.value)) {
+                        continue;
+                    }
+                    
+                    // 应用正则表达式清理
+                    String cleaned = action.removePattern.matcher(original).replaceAll("");
+                    
+                    if (!cleaned.equals(original)) {
+                        // 实际更新NBT数据
+                        if (updateTagAtPath(target, fullPath, StringTag.valueOf(cleaned))) {
+                            modified = true;
+                            LOGGER.info("\033[93mRule '{}' cleaned string at path '{}' in file {}.nbt\033[0m", 
+                                ruleName, fullPath, fileName);
+                        }
                     }
                 }
             }
+        } catch (Exception e) {
+            LOGGER.warn("\033[95mError applying nested string remove for rule '{}': {}\033[0m", ruleName, e.getMessage());
         }
         
         return modified;
     }
     
-    private boolean applyIncludeRule(CompoundTag data, FilterRule rule, 
-                                   String playerName, String fileName, String itemId, String path) {
-        boolean modified = false;
+    /**
+     * 支持通配符的路径查找，返回标签及其完整路径
+     */
+    private List<TagWithPath> findTagsByPath(Tag current, String path) {
+        return findTagsByPath(current, path.split("\\."), 0, "");
+    }
+    
+    private List<TagWithPath> findTagsByPath(Tag current, String[] pathParts, int depth, String currentPath) {
+        List<TagWithPath> results = new ArrayList<>();
         
-        // Apply rule to current include level
-        Set<String> keysToRemove = new HashSet<>();
-        for (String key : data.getAllKeys()) {
-            if (rule.whitelist != null) {
-                if (!rule.whitelist.contains(key)) {
-                    keysToRemove.add(key);
+        if (depth >= pathParts.length) {
+            results.add(new TagWithPath(current, currentPath));
+            return results;
+        }
+        
+        String part = pathParts[depth];
+        String newPath = currentPath.isEmpty() ? part : currentPath + "." + part;
+        
+        if (part.equals("*")) {
+            // 通配符 - 遍历所有元素
+            if (current instanceof CompoundTag compound) {
+                for (String key : compound.getAllKeys()) {
+                    Tag child = compound.get(key);
+                    String childPath = currentPath.isEmpty() ? key : currentPath + "." + key;
+                    results.addAll(findTagsByPath(child, pathParts, depth + 1, childPath));
                 }
-            } else if (rule.blacklist != null) {
-                if (rule.blacklist.contains(key)) {
-                    keysToRemove.add(key);
+            } else if (current instanceof ListTag list) {
+                for (int i = 0; i < list.size(); i++) {
+                    Tag child = list.get(i);
+                    String childPath = currentPath + "[" + i + "]";
+                    results.addAll(findTagsByPath(child, pathParts, depth + 1, childPath));
                 }
             }
-        }
-        
-        // Remove invalid keys
-        for (String key : keysToRemove) {
-            data.remove(key);
-            modified = true;
-            LOGGER.info("Removed key '{}' from path '{}' in item '{}' in file {}.nbt", 
-                key, path, itemId, fileName);
-        }
-        
-        // Recursively apply nested include rules
-        if (rule.include != null) {
-            for (Map.Entry<String, FilterRule> includeEntry : rule.include.entrySet()) {
-                String includeKey = includeEntry.getKey();
-                FilterRule includeRule = includeEntry.getValue();
-                
-                if (data.contains(includeKey)) {
-                    if (data.get(includeKey) instanceof CompoundTag includeData) {
-                        modified |= applyIncludeRule(includeData, includeRule, playerName, fileName, itemId, path + "." + includeKey);
+        } else if (part.endsWith("[*]")) {
+            // 数组通配符
+            String arrayName = part.substring(0, part.length() - 3);
+            if (current instanceof CompoundTag compound && compound.contains(arrayName)) {
+                Tag array = compound.get(arrayName);
+                if (array instanceof ListTag list) {
+                    for (int i = 0; i < list.size(); i++) {
+                        Tag child = list.get(i);
+                        String childPath = currentPath.isEmpty() ? arrayName + "[" + i + "]" : currentPath + "." + arrayName + "[" + i + "]";
+                        results.addAll(findTagsByPath(child, pathParts, depth + 1, childPath));
                     }
                 }
             }
+        } else if (part.contains("[")) {
+            // 具体数组索引，如 messages[0]
+            String listName = part.substring(0, part.indexOf("["));
+            String indexStr = part.substring(part.indexOf("[") + 1, part.indexOf("]"));
+            
+            if (current instanceof CompoundTag compound && compound.contains(listName)) {
+                Tag listTag = compound.get(listName);
+                if (listTag instanceof ListTag list) {
+                    if (indexStr.equals("*")) {
+                        // 遍历所有数组元素
+                        for (int i = 0; i < list.size(); i++) {
+                            Tag child = list.get(i);
+                            String childPath = currentPath.isEmpty() ? listName + "[" + i + "]" : currentPath + "." + listName + "[" + i + "]";
+                            results.addAll(findTagsByPath(child, pathParts, depth + 1, childPath));
+                        }
+                    } else {
+                        // 具体索引
+                        try {
+                            int index = Integer.parseInt(indexStr);
+                            if (index < list.size()) {
+                                Tag child = list.get(index);
+                                String childPath = currentPath.isEmpty() ? listName + "[" + index + "]" : currentPath + "." + listName + "[" + index + "]";
+                                results.addAll(findTagsByPath(child, pathParts, depth + 1, childPath));
+                            }
+                        } catch (NumberFormatException e) {
+                            LOGGER.warn("\033[95mInvalid array index: {}\033[0m", indexStr);
+                        }
+                    }
+                }
+            }
+        } else {
+            // 普通路径
+            if (current instanceof CompoundTag compound && compound.contains(part)) {
+                Tag child = compound.get(part);
+                results.addAll(findTagsByPath(child, pathParts, depth + 1, newPath));
+            }
         }
         
-        return modified;
+        return results;
+    }
+    
+    /**
+     * 根据路径更新NBT标签
+     */
+    private boolean updateTagAtPath(CompoundTag root, String path, Tag newTag) {
+        if (path.isEmpty()) {
+            return false;
+        }
+        
+        String[] pathParts = path.split("\\.");
+        CompoundTag current = root;
+        
+        // 遍历到目标节点的父节点
+        for (int i = 0; i < pathParts.length - 1; i++) {
+            String part = pathParts[i];
+            
+            // 处理数组索引，如 [0]
+            if (part.contains("[")) {
+                String listName = part.substring(0, part.indexOf("["));
+                int index = Integer.parseInt(part.substring(part.indexOf("[") + 1, part.indexOf("]")));
+                
+                if (current.contains(listName) && current.get(listName) instanceof ListTag list) {
+                    if (index < list.size() && list.get(index) instanceof CompoundTag compound) {
+                        current = compound;
+                    } else {
+                        return false; // 路径无效
+                    }
+                } else {
+                    return false; // 路径无效
+                }
+            } else {
+                if (current.contains(part) && current.get(part) instanceof CompoundTag compound) {
+                    current = compound;
+                } else {
+                    return false; // 路径无效
+                }
+            }
+        }
+        
+        // 更新目标节点
+        String targetKey = pathParts[pathParts.length - 1];
+        
+        // 处理数组索引
+        if (targetKey.contains("[")) {
+            String listName = targetKey.substring(0, targetKey.indexOf("["));
+            int index = Integer.parseInt(targetKey.substring(targetKey.indexOf("[") + 1, targetKey.indexOf("]")));
+            
+            if (current.contains(listName) && current.get(listName) instanceof ListTag list) {
+                if (index < list.size()) {
+                    list.set(index, newTag);
+                    return true;
+                }
+            }
+        } else {
+            if (current.contains(targetKey)) {
+                current.put(targetKey, newTag);
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    private boolean removeTagAtPath(CompoundTag root, String path, String playerName, String fileName, String ruleName) {
+        String[] parts = path.split("\\.");
+        CompoundTag current = root;
+        
+        // 遍历到目标节点的父节点
+        for (int i = 0; i < parts.length - 1; i++) {
+            String part = parts[i];
+            if (!current.contains(part) || !(current.get(part) instanceof CompoundTag)) {
+                return false;
+            }
+            current = (CompoundTag) current.get(part);
+        }
+        
+        String targetKey = parts[parts.length - 1];
+        if (current.contains(targetKey)) {
+            current.remove(targetKey);
+            LOGGER.info("\033[93mRule '{}' removed path '{}' in file {}.nbt\033[0m", ruleName, path, fileName);
+            return true;
+        }
+        
+        return false;
+    }
+    
+    private CompoundTag readNbtFile(Path filePath) throws IOException {
+        int maxRetries = 6;
+        int retryDelayMs = 500;
+    
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try (InputStream is = Files.newInputStream(filePath);
+                 GZIPInputStream gzipIs = new GZIPInputStream(is);
+                 DataInputStream dataIs = new DataInputStream(gzipIs)) {
+            
+                CompoundTag nbt = NbtIo.read(dataIs);
+                if (nbt != null) {
+                    if (attempt > 1) {
+                        LOGGER.info("\033[92mSuccessfully read NBT file after {} attempts: {}\033[0m", attempt, filePath);
+                    }
+                    return nbt;
+                }
+            
+            } catch (Exception e) {
+                if (attempt < maxRetries) {
+                    LOGGER.warn("\033[91mFailed to read NBT file (attempt {}/{}): {}. Retrying in {}ms...\033[0m", 
+                        attempt, maxRetries, filePath, retryDelayMs, e);
+                    try {
+                        Thread.sleep(retryDelayMs);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Interrupted during retry delay", ie);
+                    }
+                } else {
+                    LOGGER.error("\033[91mFailed to read NBT file after {} attempts: {}\033[0m", maxRetries, filePath, e);
+                }
+            }
+        }
+    
+        return null;
+    }
+
+    private void writeNbtFile(CompoundTag nbt, Path filePath) throws IOException {
+        try (OutputStream os = Files.newOutputStream(filePath);
+             GZIPOutputStream gzipOs = new GZIPOutputStream(os);
+             DataOutputStream dataOs = new DataOutputStream(gzipOs)) {
+            NbtIo.write(nbt, dataOs);
+        }
     }
     
     private static class FilterRule {
-        final String id;
-        Set<String> whitelist;
-        Set<String> blacklist;
-        Map<String, FilterRule> include;
+        final String name;
+        final String targetPath;
+        final List<Condition> conditions = new ArrayList<>();
+        final List<CleanupAction> cleanupActions = new ArrayList<>();
         
-        FilterRule(String id) {
-            this.id = id;
+        FilterRule(String name, String targetPath) {
+            this.name = name;
+            this.targetPath = targetPath;
         }
     }
     
+    private static class Condition {
+        final String type;
+        String path;
+        Object value;
+        
+        Condition(String type) {
+            this.type = type;
+        }
+    }
+    
+    private static class CleanupAction {
+        final String type;
+        final String targetPath;
+        String removeStrategy;
+        Condition condition;
+        Pattern removePattern;
+        
+        CleanupAction(String type, String targetPath) {
+            this.type = type;
+            this.targetPath = targetPath;
+        }
+    }
+    
+    /**
+     * 用于存储标签及其路径的内部类
+     */
+    private static class TagWithPath {
+        public final Tag tag;
+        public final String path;
+        
+        public TagWithPath(Tag tag, String path) {
+            this.tag = tag;
+            this.path = path;
+        }
+    }
+    
+    private void notifyPlayer(String playerName, String fileName) {
+        try {
+            MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+            if (server != null) {
+                ServerPlayer player = server.getPlayerList().getPlayerByName(playerName);
+                if (player != null) {
+                    Component message = Component.literal("The schematic diagram you uploaded appears to be abnormal.")
+                            .withStyle(ChatFormatting.GOLD);
+                    player.sendSystemMessage(message);
+                    
+                    LOGGER.debug("Notified player {} about anomalous schematic: {}.nbt", 
+                        playerName, fileName);
+                } else {
+                    LOGGER.debug("Player {} not online, cannot send anomaly notification", playerName);
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.warn("\033[95mFailed to notify player {} about anomalous schematic\033[0m", playerName, e);
+        }
+    }
+
     public static class DetectionResult {
         public final boolean hasAnomalies;
         public final String message;
@@ -603,20 +872,6 @@ public class SchematicNBTDetector {
         public DetectionResult(boolean hasAnomalies, String message) {
             this.hasAnomalies = hasAnomalies;
             this.message = message;
-        }
-    }
-    
-    private static class BannedKeywordResult {
-        public final boolean found;
-        public final String keyword;
-        public final String path;
-        public final String value;
-        
-        public BannedKeywordResult(boolean found, String keyword, String path, String value) {
-            this.found = found;
-            this.keyword = keyword;
-            this.path = path;
-            this.value = value;
         }
     }
 }
