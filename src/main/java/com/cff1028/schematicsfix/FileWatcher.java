@@ -77,7 +77,8 @@ public class FileWatcher {
             Files.createDirectories(dir);
         }
         
-        Files.walk(dir, 1)
+        // 递归注册所有子目录
+        Files.walk(dir)
             .filter(Files::isDirectory)
             .forEach(subDir -> {
                 try {
@@ -141,16 +142,41 @@ public class FileWatcher {
     private void handleDirectoryEvent(WatchEvent.Kind<?> kind, Path dirPath) {
         if (kind == StandardWatchEventKinds.ENTRY_CREATE) {
             try {
+                // 递归注册新创建目录及其所有子目录
                 registerAllDirectories(dirPath);
-                LOGGER.debug("Registered new directory: {}", dirPath);
+                LOGGER.debug("Registered new directory and its subdirectories: {}", dirPath);
+                
+                // 立即检查新目录中是否已有NBT文件
+                checkExistingFilesInDirectory(dirPath);
             } catch (IOException e) {
                 LOGGER.warn("Failed to register new directory: {}", dirPath, e);
             }
         }
     }
 
+    private void checkExistingFilesInDirectory(Path directory) {
+        try {
+            Files.walk(directory)
+                .filter(Files::isRegularFile)
+                .filter(this::isNbtFile)
+                .forEach(filePath -> {
+                    // 对于已存在的文件，模拟创建事件
+                    handleFileCreate(filePath, getFolderName(filePath), filePath.getFileName().toString());
+                    LOGGER.debug("Found existing NBT file during directory registration: {}", filePath);
+                });
+        } catch (IOException e) {
+            LOGGER.warn("Failed to check existing files in directory: {}", directory, e);
+        }
+    }
+
+    private String getFolderName(Path filePath) {
+        // 获取相对于监控根目录的路径
+        Path relativePath = watchDir.relativize(filePath.getParent());
+        return relativePath.toString();
+    }
+
     private void handleFileEvent(WatchEvent.Kind<?> kind, Path filePath, Path parentDir) {
-        String folderName = parentDir.getFileName().toString();
+        String folderName = getFolderName(filePath);
         String fileName = filePath.getFileName().toString();
 
         try {
@@ -170,7 +196,7 @@ public class FileWatcher {
     private void handleFileCreate(Path filePath, String folderName, String fileName) {
         FileTracker tracker = new FileTracker(filePath);
         trackedFiles.put(filePath, tracker);
-        LOGGER.info("Detected new file {} in folder {}", fileName, folderName);
+        LOGGER.info("\033[94mDetected new file {} in folder {}\033[0m", fileName, folderName);
     }
 
     private void handleFileModify(Path filePath, String folderName, String fileName) {
@@ -179,7 +205,7 @@ public class FileWatcher {
         if (tracker == null) {
             tracker = new FileTracker(filePath);
             trackedFiles.put(filePath, tracker);
-            LOGGER.info("Detected existing file {} in folder {}", fileName, folderName);
+            LOGGER.info("\033[94mDetected existing file {} in folder {}\033[0m", fileName, folderName);
         } else {
             tracker.update();
             LOGGER.debug("File {} in folder {} has been modified", fileName, folderName);
@@ -211,18 +237,18 @@ public class FileWatcher {
                 }
                 
                 if (timeSinceLastChange >= maxStableTime && !tracker.hasNotifiedStable()) {
-                    String folderName = filePath.getParent().getFileName().toString();
+                    String folderName = getFolderName(filePath);
                     String fileName = filePath.getFileName().toString().replace(".nbt", "");
                     
-                    LOGGER.info("File {} in folder {} upload completed (stable for {}ms), starting anomaly detection", 
+                    LOGGER.info("\033[94mFile {} in folder {} upload completed (stable for {}ms), starting anomaly detection\033[0m", 
                         fileName, folderName, timeSinceLastChange);
                     
                     if (Config.INSTANCE.autoCleanAnomalies.get()) {
                         SchematicNBTDetector.DetectionResult result = nbtDetector.detectAnomalies(folderName, fileName);
                         if (result.hasAnomalies) {
-                            LOGGER.warn("Anomalies detected and processed: {}", result.message);
+                            LOGGER.warn("\033[91mAnomalies detected and processed: {}\033[0m", result.message);
                         } else {
-                            LOGGER.info("Schematic validation passed: {}", result.message);
+                            LOGGER.info("\033[92mSchematic validation passed: {}\033[0m", result.message);
                         }
                     }
                     
